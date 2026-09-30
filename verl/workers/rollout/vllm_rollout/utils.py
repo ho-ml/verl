@@ -28,6 +28,7 @@ import torch
 from vllm.outputs import RequestOutput
 
 from verl.utils.device import get_device_name, is_npu_available
+from verl.utils.profiler import events
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.rocm_vllm_moe_expert_map import restore_moe_expert_maps
@@ -330,13 +331,15 @@ class vLLMColocateWorkerExtension:
                 )
                 lora_weights.clear()
                 return
-            self._update_weights(
-                weights,
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-            )
+            with events.span("sync_vllm_load_bucket", sync=True, n=len(weights)):
+                self._update_weights(
+                    weights,
+                    peft_config=peft_config,
+                    base_sync_done=base_sync_done,
+                )
 
-        receiver.receive_weights(on_bucket_received=on_bucket_received)
+        with events.span("sync_vllm_receive_all"):
+            receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:
@@ -361,8 +364,9 @@ class vLLMColocateWorkerExtension:
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
             with fold_unquantized_moe_params(staged_moe_layers):
-                for model, model_config in self._iter_all_models_with_config():
-                    process_weights_after_loading(model, model_config, self.device)
+                with events.span("sync_vllm_post_load", sync=True):
+                    for model, model_config in self._iter_all_models_with_config():
+                        process_weights_after_loading(model, model_config, self.device)
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.

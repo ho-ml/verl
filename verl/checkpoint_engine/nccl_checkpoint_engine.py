@@ -35,6 +35,7 @@ from verl.checkpoint_engine.base import (
     split_weight_chunks,
 )
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.profiler import events
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -103,7 +104,9 @@ class BroadcastOperation:
             self.bucket = self.bucket[: self.metadata["length"]]
 
         # broadcast tensor via NCCL
-        collective.broadcast(self.bucket, src_rank=0, group_name=self.group_name)
+        nbytes = int(getattr(self.bucket, "nbytes", 0))
+        with events.span("sync_nccl_broadcast", sync=True, rank=self.rank, bytes=nbytes):
+            collective.broadcast(self.bucket, src_rank=0, group_name=self.group_name)
 
     async def wait_for_complete(self) -> dict[str, TensorMeta]:
         """Wait for the broadcast operation to complete.
@@ -335,6 +338,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
             await self._relay_weights(weights)
             return
 
+        send_total = events.span("sync_send_total")
+        send_total.__enter__()
         send_buf, recv_buf = self.send_buf, self.recv_buf
         broadcast_op = None
 
@@ -354,7 +359,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
                 # wait previous broadcast op finish
                 if pipelined and broadcast_op is not None:
-                    await broadcast_op.wait_for_complete()
+                    with events.span("sync_send_wait"):
+                        await broadcast_op.wait_for_complete()
 
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
@@ -380,12 +386,14 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
             # keep the relays in step: no-op once the bucket's broadcast has already been drained
             if not pipelined and broadcast_op is not None:
-                await broadcast_op.wait_for_complete()
+                with events.span("sync_send_wait"):
+                    await broadcast_op.wait_for_complete()
 
         # broadcast last bucket
         torch.cuda.synchronize()
         if pipelined and broadcast_op is not None:
-            await broadcast_op.wait_for_complete()
+            with events.span("sync_send_wait"):
+                await broadcast_op.wait_for_complete()
 
         broadcast_op = BroadcastOperation(
             rank=self.rank,
@@ -395,13 +403,15 @@ class NCCLCheckpointEngine(CheckpointEngine):
             socket=self.socket,
             topic=self.topic,
         )
-        await broadcast_op.wait_for_complete()
+        with events.span("sync_send_wait"):
+            await broadcast_op.wait_for_complete()
 
         # the wait_for_complete() function just waits for the NCCL kernel to be enqueued,
         # not for the kernel to finish, hence we need to synchronize to make sure the
         # buffer does not get freed before the kernel finishes.
         torch.cuda.synchronize()
 
+        send_total.__exit__(None, None, None)
         logger.info(f"Rank {self.rank} send weights done, time cost: {time.time() - start_time:.2f}s")
 
     async def _relay_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):

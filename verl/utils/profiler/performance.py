@@ -24,6 +24,7 @@ from codetiming import Timer
 
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.logger import DecoratorLoggerBase
+from . import events
 
 
 def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
@@ -144,8 +145,10 @@ def _timer(name: str, timing_raw: dict[str, float]):
         name (str): The name/identifier for this timing measurement.
         timing_raw (Dict[str, float]): Dictionary to store timing information.
     """
-    with Timer(name=name, logger=None) as timer:
+    # timer 에 기록할 수 있는 hook 추가
+    with events.span(name), Timer(name=name, logger=None) as timer:
         yield
+        
     if name not in timing_raw:
         timing_raw[name] = 0
     timing_raw[name] += timer.last

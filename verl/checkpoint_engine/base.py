@@ -24,6 +24,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.import_utils import import_external_libs
+from verl.utils.profiler import events
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
@@ -520,7 +521,8 @@ class CheckpointEngineManager:
             return {}
 
         # 1. abort and save all unfinished requests for partial rollout
-        await self.abort_replicas()
+        with events.span("sync_prep_abort"):
+            await self.abort_replicas()
 
         # 2. create a temporay worker group for all replicas
         workers = []
@@ -530,16 +532,19 @@ class CheckpointEngineManager:
         actor_wg = self.actor_wg
 
         # 3. release kv_cache before weight sync (weights stay in place)
-        await self.release_kv_cache_replicas()
+        with events.span("sync_prep_release_kv"):
+            await self.release_kv_cache_replicas()
 
         # 4. build process group
-        self.build_process_group(rollout)
+        with events.span("sync_prep_build_pg"):
+            self.build_process_group(rollout)
 
         # 5. update weights of all workers
-        results = ray.get(
-            actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
-            + rollout.update_weights(global_steps=global_steps)
-        )
+        with events.span("sync_transfer"):
+            results = ray.get(
+                actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
+                + rollout.update_weights(global_steps=global_steps)
+            )
         # The sender workers return the engine's per-sync metrics (empty for
         # backends that don't track any); merge and hand them to the trainer.
         sync_metrics: dict = {}
@@ -548,16 +553,19 @@ class CheckpointEngineManager:
                 sync_metrics.update(result)
 
         # 6. finalize all workers
-        ray.get(
-            actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
-            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
-        )
+        with events.span("sync_post_finalize"):
+            ray.get(
+                actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
+                + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+            )
 
         # 7. restore kv_cache after weight sync
-        await self.resume_kv_cache_replicas()
+        with events.span("sync_post_resume_kv"):
+            await self.resume_kv_cache_replicas()
 
         # 8. resume all unfinished requests for partial rollout
-        await self.resume_generation_replicas()
+        with events.span("sync_post_resume_gen"):
+            await self.resume_generation_replicas()
 
         return sync_metrics
 

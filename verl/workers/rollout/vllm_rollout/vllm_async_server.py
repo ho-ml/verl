@@ -50,6 +50,7 @@ from verl.utils.profiler import (
     relocate_rollout_traces,
     rollout_profiler_global_ranks,
 )
+from verl.utils.profiler import events
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
@@ -573,6 +574,8 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        t_arrive = time.time_ns()
+                
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -677,6 +680,7 @@ class vLLMHttpServer:
             "vllm_generate",
             state_lane_id=ray.get_runtime_context().get_actor_name(),
         ):
+            t_submit, t_first = time.time_ns(), None
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -693,6 +697,7 @@ class vLLMHttpServer:
                     if not admitted:
                         admitted = True
                         self._admitting -= 1
+                        t_first = time.time_ns()
                     final_res = output
             finally:
                 if not admitted:
@@ -739,9 +744,36 @@ class vLLMHttpServer:
             stop_reason = finish_reason  # for more stop reason in the future
 
         num_preempted = None
-
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
+
+        # rollout trace 기록
+        if events.enabled():
+            events.trace(
+                {
+                    "req_id": request_id,
+                    "weight_version": self.global_steps,
+                    "replica": self.replica_rank,
+                    "prompt_len": len(prompt_ids),
+                    "prompt_ids": list(prompt_ids),
+                    "max_tokens": max_tokens,
+                    "sampling": {
+                        "temperature": sampling_params.temperature,
+                        "top_p": sampling_params.top_p,
+                        "top_k": sampling_params.top_k,
+                        "ignore_eos": sampling_params.ignore_eos,
+                        "logprobs": sampling_params.logprobs,
+                    },
+                    "t_arrive_ns": t_arrive,
+                    "t_submit_ns": t_submit,
+                    "t_first_ns": t_first,
+                    "t_end_ns": time.time_ns(),
+                    "output_len": len(token_ids),
+                    "finish_reason": finish_reason,
+                    "num_preempted": num_preempted,
+                    "num_cached_tokens": extra_fields.get("num_cached_tokens"),
+                }
+            )
 
         response_kv_transfer_params = getattr(final_res, "kv_transfer_params", None)
         if response_kv_transfer_params is not None:

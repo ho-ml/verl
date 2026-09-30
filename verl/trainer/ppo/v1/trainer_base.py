@@ -78,6 +78,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
+from verl.utils.profiler import events
 from verl.utils.debug.metrics import calculate_debug_metrics
 from verl.utils.import_utils import load_extern_type
 from verl.utils.metric import reduce_metrics
@@ -468,6 +469,7 @@ class PPOTrainer(ABC):
             is_last_step = self.global_steps >= self.total_training_steps
             metrics = {}
             self.timing_raw = {}
+            events.set_step(self.global_steps)     # step 설정
 
             # 1. perform rollout and actor/critic training
             with marked_timer("step", self.timing_raw):

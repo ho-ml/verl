@@ -31,6 +31,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.plugin.platform import get_platform
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
@@ -474,6 +475,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+
+        # 학습 프로세스에만 CUDA 할당자 설정 적용 (expandable_segments:True 로 메모리 단편화 감소)
+        alloc_conf = os.environ.get("TRAIN_ALLOC_CONF")
+        if alloc_conf and not self._is_rollout:
+            get_platform().set_allocator_settings(alloc_conf)
+            logger.warning(
+                f"role={self.role} CUDA allocator settings set to {alloc_conf}"
+            )
 
         if self._is_actor:
             omega_profiler_config = config.actor.get("profiler", {})

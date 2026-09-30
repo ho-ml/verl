@@ -23,6 +23,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
 )
+from verl.utils.profiler import events
 from verl.workers.engine_workers import ActorRolloutRefWorker, DistillationConfig
 
 logger = logging.getLogger(__file__)
@@ -134,7 +135,8 @@ class DetachActorWorker(ActorRolloutRefWorker):
         if not hasattr(self, "cpu_saved_models"):
             self.cpu_saved_models = {}
 
-        self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
+        with events.span("save_model_to_cpu", sync=True, slot=n):
+            self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_model_from_cpu(self, n):
@@ -151,11 +153,12 @@ class DetachActorWorker(ActorRolloutRefWorker):
         if n in self.cpu_saved_models:
             strategy = self.config.actor.strategy
 
-            if strategy in ["fsdp2", "veomni"]:
-                cpu_sharded_state, global_spec = self.cpu_saved_models[n]
-                self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
-            else:
-                self.restore_handler(self.actor.engine.module, self.cpu_saved_models[n])
+            with events.span("restore_model_from_cpu", sync=True, slot=n):
+                if strategy in ["fsdp2", "veomni"]:
+                    cpu_sharded_state, global_spec = self.cpu_saved_models[n]
+                    self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
+                else:
+                    self.restore_handler(self.actor.engine.module, self.cpu_saved_models[n])
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_cpu_model(self, n):

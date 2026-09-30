@@ -38,6 +38,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_support_ipc
+from verl.utils.profiler import events
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
@@ -238,10 +239,12 @@ class ServerAdapter(BaseRollout):
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
         )
-        await sender.async_send_weights(weights)
+        with events.span("sync_ipc_send"):
+            await sender.async_send_weights(weights)
 
         if future is not None:
-            await future
+            with events.span("sync_vllm_wait"):
+                await future
 
         # reset caches after updating weights
         if self._has_server:

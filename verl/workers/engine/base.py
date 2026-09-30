@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.utils.device import get_device_name, get_vendor
+from verl.utils.profiler import events
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
 
@@ -124,8 +125,13 @@ class BaseEngine:
         maybe_fix_3d_position_ids(data)
 
         self.optimizer_zero_grad()
-        outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-        grad_norm = self.optimizer_step()
+
+        # 각 단계를 event hook 으로 호출해 time breakdown
+        with events.span("train_fwdbwd", sync=True):
+            outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
+        with events.span("train_optimizer_step", sync=True):
+            grad_norm = self.optimizer_step()
+
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
@@ -144,7 +150,8 @@ class BaseEngine:
         # see comments from train_batch
         maybe_fix_3d_position_ids(data)
 
-        with torch.no_grad():
+        # 추론 단계 또한 동일하게 event hook 을 통해 시간 측정
+        with torch.no_grad(), events.span("infer_batch", sync=True):
             outputs = self.forward_backward_batch(data, loss_function, forward_only=True)
         return outputs
 
