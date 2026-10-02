@@ -23,7 +23,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
 )
-from verl.utils.profiler import events
+from npurl.profiler import events
 from verl.workers.engine_workers import ActorRolloutRefWorker, DistillationConfig
 
 logger = logging.getLogger(__file__)

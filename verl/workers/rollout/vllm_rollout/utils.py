@@ -28,7 +28,7 @@ import torch
 from vllm.outputs import RequestOutput
 
 from verl.utils.device import get_device_name, is_npu_available
-from verl.utils.profiler import events
+from npurl.profiler import events
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.rocm_vllm_moe_expert_map import restore_moe_expert_maps

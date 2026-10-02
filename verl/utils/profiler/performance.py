@@ -24,7 +24,7 @@ from codetiming import Timer
 
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.logger import DecoratorLoggerBase
-from . import events
+from npurl.profiler import events
 
 
 def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:

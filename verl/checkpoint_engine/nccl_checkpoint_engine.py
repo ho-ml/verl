@@ -35,7 +35,7 @@ from verl.checkpoint_engine.base import (
     split_weight_chunks,
 )
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
-from verl.utils.profiler import events
+from npurl.profiler import events
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

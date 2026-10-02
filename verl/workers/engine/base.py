@@ -24,7 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.utils.device import get_device_name, get_vendor
-from verl.utils.profiler import events
+from npurl.profiler import events
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
 

@@ -38,7 +38,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_support_ipc
-from verl.utils.profiler import events
+from npurl.profiler import events
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender

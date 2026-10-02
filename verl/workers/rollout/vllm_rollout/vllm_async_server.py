@@ -50,7 +50,7 @@ from verl.utils.profiler import (
     relocate_rollout_traces,
     rollout_profiler_global_ranks,
 )
-from verl.utils.profiler import events
+from npurl.profiler import events
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
