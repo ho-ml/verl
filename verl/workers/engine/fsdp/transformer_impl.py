@@ -726,12 +726,17 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
 
-        # compute num_tokens in global batch for loss normalization
-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
-        torch.distributed.all_reduce(
-            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
-        )
-        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        # compute num_tokens in global batch for loss normalization. A caller that accumulates gradients over several
+        # calls before one optimizer step (streaming update) passes its own normalizer and rescales at the step.
+        override = tu.get_non_tensor_data(data=data, key="batch_num_tokens_override", default=None)
+        if override is not None:
+            tu.assign_non_tensor(data, batch_num_tokens=override)
+        else:
+            batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(

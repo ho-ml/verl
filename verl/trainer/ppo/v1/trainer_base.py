@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -533,6 +534,8 @@ class PPOTrainer(ABC):
         self._shutdown_dump_executor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        if self._stream_enabled():
+            return self._step_stream(metrics, timing_raw)
         train_batch_size = self.config.data.train_batch_size
         assert train_batch_size % self.parameter_sync_step == 0, (
             f"train_batch_size ({train_batch_size}) must be divisible by "
@@ -560,6 +563,107 @@ class PPOTrainer(ABC):
 
         metrics.update(metrics_aggregator.get_aggregated_metrics())
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
+
+    # ------------------------------ streaming update ------------------------------
+    # trainer.v1.separate_async.stream=True: train each GRPO group as soon as all its samples are rewarded, while
+    # rollout continues, accumulating gradients; one optimizer step after the step's last group. A group's
+    # advantages only use its own rewards, π_old is the unchanged weights, and the token-mean normalizer is applied
+    # once at the end (workers' stream_step), so the update equals the batch update up to summation order.
+
+    def _stream_enabled(self) -> bool:
+        v1 = self.config.trainer.get("v1", {}) or {}
+        sa = v1.get("separate_async", {}) or {}
+        return bool(sa.get("stream", False))
+
+    def _stream_check(self):
+        cfg = self.config
+        actor = cfg.actor_rollout_ref.actor
+        errs = []
+        if self.parameter_sync_step != 1:
+            errs.append(f"parameter_sync_step must be 1 (one update per step), got {self.parameter_sync_step}")
+        if actor.ppo_epochs != 1:
+            errs.append(f"ppo_epochs must be 1, got {actor.ppo_epochs}")
+        if actor.loss_agg_mode != "token-mean":
+            errs.append(f"loss_agg_mode must be token-mean (its normalizer is applied at the step), got {actor.loss_agg_mode}")
+        if self.use_critic:
+            errs.append("no critic")
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            errs.append("rewards must come from the reward loop (per sample), not a colocated reward model")
+        rc = cfg.algorithm.get("rollout_correction", {}) or {}
+        if rc.get("rollout_is_batch_normalize", False):
+            errs.append("rollout_is_batch_normalize needs the whole batch")
+        if cfg.algorithm.get("use_kl_in_reward", False):
+            errs.append("use_kl_in_reward (adaptive KL) needs the whole batch")
+        if getattr(self, "_enable_hybrid_replicas", False):
+            errs.append("hybrid replicas share the trainer GPUs during rollout")
+        if errs:
+            raise ValueError("trainer.v1.separate_async.stream: " + "; ".join(errs))
+
+    def _step_stream(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        self._stream_check()
+        train_batch_size = self.config.data.train_batch_size
+        sa = self.config.trainer.v1.separate_async
+        max_groups = int(sa.get("stream_max_groups", 0) or 0)
+        prepare_metrics = self.prepare_step()
+        aggregator = MetricsAggregator()
+        if prepare_metrics:
+            aggregator.add_step_metrics(prepare_metrics)
+        self.local_trigger_step = 0
+        self.actor_rollout_wg.stream_zero_grad_actor()
+        consumed, total_tokens, chunks = 0, 0.0, 0
+        keys, tags, partition_id = [], [], "train"
+        t_first = None
+        while consumed < train_batch_size:
+            iter_metrics: dict = {}
+            with marked_timer("gen", timing_raw, color="red"):
+                self.on_sample_begin()
+                avail = self.replay_buffer.get_sampleable_count(self.global_steps, "train")
+                k = max(1, min(avail, train_batch_size - consumed))
+                if max_groups > 0:
+                    k = min(k, max_groups)
+                batch, off_policy_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps, partition_id="train", batch_size=k
+                )
+                iter_metrics.update(off_policy_metrics)
+                batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                self.on_sample_end()
+            t_first = t_first or time.time()
+            batch = self._balance_batch(batch, metrics=iter_metrics)
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                batch = self._compute_old_log_prob(batch, metrics=iter_metrics)
+            if self.use_reference_policy:
+                with marked_timer("ref", timing_raw, color="olive"):
+                    batch = self._compute_ref_log_prob(batch, metrics=iter_metrics)
+            with marked_timer("adv", timing_raw, color="brown"):
+                batch = self._compute_advantage(batch, metrics=iter_metrics)
+            with marked_timer("update_actor", timing_raw, color="red"):
+                batch.extra_info.update(self._actor_update_extra_info())
+                output: TensorDict = self.actor_rollout_wg.stream_update_actor(batch)
+                out = rename_dict(output["metrics"], "actor/")
+                out["perf/mfu/actor"] = out.pop("actor/mfu")
+                # losses of a streaming call are sums (normalizer 1), not the batch's token means
+                for name in ("actor/pg_loss", "actor/loss"):
+                    if name in out:
+                        out[name.replace("actor/", "stream/") + "_sum"] = out.pop(name)
+                tokens = out.pop("actor/stream_tokens")
+                while isinstance(tokens, (list, tuple)):  # gathered over DP ranks: every entry is the global count
+                    tokens = tokens[0]
+                total_tokens += float(tokens)
+                iter_metrics.update(reduce_metrics(out))
+            sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+            aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
+            consumed += k
+            chunks += 1
+            keys.extend(batch.keys)
+            tags.extend(batch.tags)
+            partition_id = batch.partition_id
+        with marked_timer("update_actor_step", timing_raw, color="red"):
+            step_out = self.actor_rollout_wg.stream_step_actor(total_tokens)[0]
+        metrics.update(aggregator.get_aggregated_metrics())
+        metrics.update({"actor/grad_norm": step_out["grad_norm"], "actor/lr": step_out["lr"],
+                        "stream/chunks": chunks, "stream/tokens": total_tokens,
+                        "stream/train_after_first_s": time.time() - t_first})
+        return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
         """Run a single local update: sample one mini-batch and perform the full PPO pipeline once."""
@@ -1828,6 +1932,16 @@ class PPOTrainer(ABC):
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
+        batch.extra_info.update(self._actor_update_extra_info())
+        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+        output = rename_dict(output["metrics"], "actor/")
+        output["perf/mfu/actor"] = output.pop("actor/mfu")
+        actor_metrics = reduce_metrics(output)
+        metrics.update(actor_metrics)
+
+        return batch
+
+    def _actor_update_extra_info(self) -> dict:
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
@@ -1857,15 +1971,7 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
-        batch.extra_info.update(extra_info)
-
-        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
-        output = rename_dict(output["metrics"], "actor/")
-        output["perf/mfu/actor"] = output.pop("actor/mfu")
-        actor_metrics = reduce_metrics(output)
-        metrics.update(actor_metrics)
-
-        return batch
+        return extra_info
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics

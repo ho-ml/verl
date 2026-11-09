@@ -35,7 +35,7 @@ from verl.plugin.platform import get_platform
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -338,6 +338,75 @@ class TrainingWorker(Worker, DistProfilerExtension):
             else:
                 output = None
         return output
+
+    # -- streaming update: gradients of several calls accumulate into one optimizer step ------------------------
+    # The trainer feeds each finished GRPO group (or a few) through `stream_forward_backward` while rollout goes on,
+    # then calls `stream_step` once. Each call normalizes its loss by 1 instead of the batch's token count (the total
+    # is only known at the end); `stream_step` multiplies the accumulated gradients by 1 / total tokens before
+    # clipping, which is the token-mean loss of the whole batch.
+
+    def stream_zero_grad(self) -> None:
+        with self.engine.train_mode(zero_grad_on_exit=False):
+            self.engine.optimizer_zero_grad()
+
+    def stream_forward_backward(self, data: TensorDict) -> TensorDict:
+        assert self.loss_fn is not None, "loss function can't be None when calling stream_forward_backward"
+        maybe_fix_3d_position_ids(data)
+        for key in ("mini_batch_size", "num_mini_batch", "epochs", "seed", "dataloader_kwargs"):
+            tu.pop(data, key=key, default=None)
+        disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
+        dp_group = self.engine.get_data_parallel_group()
+        # global token count of this call (the step's normalizer is their sum)
+        tokens = data["loss_mask"].sum().to(get_device_id()).float()
+        torch.distributed.all_reduce(tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+        global_token_num = None
+        if "input_ids" in data:
+            global_token_num = data["input_ids"].offsets().diff().tolist()
+            gathered = [None] * torch.distributed.get_world_size(dp_group)
+            torch.distributed.all_gather_object(gathered, global_token_num, dp_group)
+            global_token_num = [x for xs in gathered for x in xs]
+        default_keys = dict(
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
+            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+            max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
+            micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
+            use_fused_kernels=self.engine_config.use_fused_kernels,
+        )
+        for key, val in default_keys.items():
+            if key not in data.keys():
+                tu.assign_non_tensor(data, **{key: val})
+        tu.assign_non_tensor(data, global_token_num=NonTensorData(global_token_num), batch_num_tokens_override=1)
+        with (
+            self.engine.train_mode(disable_auto_offload=disable_auto_offload, zero_grad_on_exit=False),
+            Timer(name="stream_forward_backward", logger=None) as timer,
+        ):
+            output = self.engine.forward_backward_batch(data, loss_function=self.loss_fn, forward_only=False)
+        if self.engine.is_mp_src_rank_with_outputs():
+            output.pop("model_output", None)
+            output["metrics"]["stream_tokens"] = tokens.item()
+            final = self._postprocess_output(
+                output, global_token_num=global_token_num, delta_time=timer.last, forward_only=False, images_seqlens=None
+            )
+            # as train_mini_batch does: DP-gathered Metric lists become one Metric, other lists are flattened
+            metrics = tu.get(final, "metrics")
+            for key, val in metrics.items():
+                if isinstance(val, list) and val:
+                    metrics[key] = Metric.aggregate_dp(val) if isinstance(val[0], Metric) else list(chain.from_iterable(
+                        v if isinstance(v, list) else [v] for v in val))
+            return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
+        return None
+
+    def stream_step(self, total_tokens: float) -> dict:
+        assert total_tokens > 0, "stream_step without tokens"
+        with self.engine.train_mode(zero_grad_on_exit=True):
+            scale = 1.0 / float(total_tokens)
+            with torch.no_grad():
+                for p in self.engine.module.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+            grad_norm = self.engine.optimizer_step()
+            lr = self.engine.lr_scheduler_step()
+        return {"grad_norm": grad_norm, "lr": lr}
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @DistProfiler.annotate(color="red", role="train_batch")
@@ -722,6 +791,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stream_zero_grad_actor(self) -> None:
+        self.actor.stream_zero_grad()
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_stream_update")
+    @_with_routing_replay_flag(enabled=True)
+    def stream_update_actor(self, data: TensorDict) -> TensorDict:
+        output = self.actor.stream_forward_backward(data=data)
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stream_step_actor(self, total_tokens: float) -> dict:
+        return self.actor.stream_step(total_tokens)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
