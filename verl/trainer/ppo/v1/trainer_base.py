@@ -610,6 +610,8 @@ class PPOTrainer(ABC):
             aggregator.add_step_metrics(prepare_metrics)
         self.local_trigger_step = 0
         self.actor_rollout_wg.stream_zero_grad_actor()
+        # max_off_policy_strategy=wait would block sampling while any prompt of this step still runs
+        self.replay_buffer.stream_current_step = True
         consumed, total_tokens, chunks = 0, 0.0, 0
         keys, tags, partition_id = [], [], "train"
         t_first = None
@@ -657,6 +659,7 @@ class PPOTrainer(ABC):
             keys.extend(batch.keys)
             tags.extend(batch.tags)
             partition_id = batch.partition_id
+        self.replay_buffer.stream_current_step = False
         with marked_timer("update_actor_step", timing_raw, color="red"):
             step_out = self.actor_rollout_wg.stream_step_actor(total_tokens)[0]
         metrics.update(aggregator.get_aggregated_metrics())

@@ -550,6 +550,9 @@ class ReplayBufferAsync(ReplayBuffer):
         if self.max_off_policy_threshold is not None and self.max_off_policy_strategy == "wait":
             for key in self.pending_keys[partition_id] | self.running_keys[partition_id]:
                 prompt_global_steps = self.prompt_global_steps[partition_id][key]
+                # streaming update: the step's own prompts cannot go stale before its single optimizer step
+                if getattr(self, "stream_current_step", False) and prompt_global_steps == global_steps:
+                    continue
                 if (global_steps - prompt_global_steps + 1) >= self.max_off_policy_threshold:
                     return False
 
